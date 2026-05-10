@@ -19,6 +19,7 @@
 #include <vcg/complex/algorithms/smooth.h>
 #include <vcg/complex/algorithms/update/curvature.h>
 #include <vcg/complex/algorithms/update/quality.h>
+#include <vcg/complex/algorithms/update/normal.h>
 #include <wrap/io_trimesh/export.h>
 #include <wrap/io_trimesh/import.h>
 #include <wrap/callback.h>
@@ -71,8 +72,8 @@ struct VisLogger
 
 	bool               enabled = false;
 	Mode               mode    = Mode::Overview;
-	QString            filePath; // len pre PerVertex
-	std::ostringstream buf;      // bufferujeme (výkon)
+	QString            filePath; // only for PerVertex
+	std::ostringstream buf;      // buffering 
 
 	void clear()
 	{
@@ -174,9 +175,8 @@ static inline void AppendStats(std::ostringstream& oss, const char* name, const 
 
 
 
-
-// Multi-line flush do MeshLab logu po riadkoch.
-// prázdne riadky nahradíme " ", aby UI zachovalo odstupy.
+// Flush multiple lines to the MeshLab log one line at a time.
+// Replace empty lines with " " so that the UI maintains its spacing.
 static inline void LogMultiline(GLLogStream& log, int level, const std::string& text)
 {
 	std::istringstream iss(text);
@@ -315,7 +315,7 @@ void Plugin::saveHistogramImage(const std::vector<float>& data, const std::strin
 	// X axis labels (0 .. 1 range)
 	painter.setPen(Qt::black);
 
-	const int xTicks = 4; // kolko popisov chceme
+	const int xTicks = 4; // How many descriptions do we want
 
 	for (int i = 0; i <= xTicks; ++i) {
 		float value = float(i) / xTicks; // 0..1
@@ -413,6 +413,7 @@ RichParameterList Plugin::initParameterList(const QAction* a, const MeshDocument
 		vertexMetrics.push_back("Valence");
 		vertexMetrics.push_back("AngleDeviation360");
 		vertexMetrics.push_back("MeanCurvature");
+		vertexMetrics.push_back("NormalDeviation"); 
 
 
 		QStringList colorMapModes;
@@ -469,7 +470,7 @@ RichParameterList Plugin::initParameterList(const QAction* a, const MeshDocument
 
 		parlst.addParam(RichInt(
 			"neighborhoodRadius",
-			0, // 0 = vypnuté
+			0, // 0 = off
 			"Neighborhood radius",
 			"How many edge-steps from the vertex are included (0 = only the vertex)."));
 
@@ -574,9 +575,10 @@ double Plugin::GetMetricOptimalValue(int metricID)
 	case 2: return 60.0; // MinAngle
 	case 3: return 60.0; // AvgAngle
 	case 4: return 1.0;  // EdgeLengthRatio
-	case 5: return 6.0;  // Valence (RAW!)
+	case 5: return 6.0;  // Valence
 	case 6: return 0.0;  // AngleDeviation360
 	case 7: return 0.0;  // MeanCurvature
+	case 8: return 0.0;  // NormalDeviation
 	default: return 0.0;
 	}
 }
@@ -595,7 +597,8 @@ bool Plugin::IsFinite(double x)
 	return std::isfinite(x) != 0;
 }
 
-// percentil z vektora (p v [0..1])
+
+// percentile of a vector (p in [0,1])
 double Plugin::Percentile(std::vector<double>& a, double p)
 {
 	if (a.empty())
@@ -665,11 +668,11 @@ bool Plugin::isValidNumber(double x)
 	if (isNegativeNaN(x))
 		return false;
 
-	// zvyšok NaN testov (x != x je univerzálny NaN check)
+	// remaining NaN checks (x != x is a universal NaN check)
 	if (x != x)
 		return false;
 
-	// veľmi veľké absolútne hodnoty považujeme za overflow/INF
+	// very large absolute values as overflow or INF
 	if (fabs(x) > 1e300)
 		return false;
 
@@ -697,13 +700,13 @@ void Plugin::BuildVertexFaceAdjacency(CMeshO& mesh)
 		CMeshO::VertexPointer v1 = fi->V(1);
 		CMeshO::VertexPointer v2 = fi->V(2);
 
-		// základné sanity
+		// basic sanitary checks
 		if (!v0 || !v1 || !v2)
 			continue;
 		if (v0->IsD() || v1->IsD() || v2->IsD())
 			continue;
 
-		// degenerované tvary preskočíme
+		// skip the degenerate forms
 		if (v0 == v1 || v1 == v2 || v2 == v0)
 			continue;
 
@@ -842,7 +845,6 @@ Plugin::GetColorForValue(double value, double min, double optimal, double max, i
 }
 
 
-
 double Plugin::ComputeVertexMetric(int metricID, CMeshO::VertexPointer v, CMeshO& mesh)
 {
 	if (!v || v->IsD())
@@ -855,10 +857,13 @@ double Plugin::ComputeVertexMetric(int metricID, CMeshO::VertexPointer v, CMeshO
 	std::vector<double> angles;
 	std::vector<double> edgeLengths;
 
-	// namiesto prechádzania všetkých facov použijeme m_vertFaceAdj 
+	// Set of unique vertices directly connected to v by an edge.
+	// This is used for the valence metric.
+	std::set<CMeshO::VertexPointer> adjacentVertices;
+
 	auto itFaces = m_vertFaceAdj.find(v);
 	if (itFaces == m_vertFaceAdj.end()) {
-		// vertex nemá žiadne incidentné facy
+		// Vertex has no incident faces.
 		return 0.0;
 	}
 
@@ -878,20 +883,22 @@ double Plugin::ComputeVertexMetric(int metricID, CMeshO::VertexPointer v, CMeshO
 				break;
 			}
 		}
+
 		if (badFace)
 			continue;
 
-		// degenerované trojuholníky
+		// Skip degenerate triangles.
 		if (fv[0] == fv[1] || fv[1] == fv[2] || fv[2] == fv[0])
 			continue;
 
-		//  index nášho vertexu v tejto face
+		// Find the index of the processed vertex in the current face.
 		int idx = -1;
-		for (int i = 0; i < 3; ++i)
+		for (int i = 0; i < 3; ++i) {
 			if (fv[i] == v) {
 				idx = i;
 				break;
 			}
+		}
 
 		if (idx == -1)
 			continue;
@@ -899,16 +906,23 @@ double Plugin::ComputeVertexMetric(int metricID, CMeshO::VertexPointer v, CMeshO
 		CMeshO::VertexPointer v1 = fv[(idx + 1) % 3];
 		CMeshO::VertexPointer v2 = fv[(idx + 2) % 3];
 
+		if (!v1 || !v2 || v1->IsD() || v2->IsD())
+			continue;
+
 		const vcg::Point3f& p1 = v1->P();
 		const vcg::Point3f& p2 = v2->P();
 
 		if (!isValidPoint(p1) || !isValidPoint(p2))
 			continue;
 
-		// dĺžky hrán
-		double a = CalculateDistance(p1, p2); // hrana medzi susedmi
-		double b = CalculateDistance(pv, p2); // hrana od v
-		double c = CalculateDistance(pv, p1); // hrana od v
+		// Store unique adjacent vertices for the valence metric.
+		adjacentVertices.insert(v1);
+		adjacentVertices.insert(v2);
+
+		// Edge lengths of the triangle.
+		double a = CalculateDistance(p1, p2); // edge between neighbouring vertices
+		double b = CalculateDistance(pv, p2); // edge from v to v2
+		double c = CalculateDistance(pv, p1); // edge from v to v1
 
 		if (!isValidNumber(a) || !isValidNumber(b) || !isValidNumber(c))
 			continue;
@@ -916,16 +930,16 @@ double Plugin::ComputeVertexMetric(int metricID, CMeshO::VertexPointer v, CMeshO
 		if (a <= 0.0 || b <= 0.0 || c <= 0.0)
 			continue;
 
-		// trojuholníková nerovnosť
+		// Triangle inequality check.
 		if (a + b <= c || a + c <= b || b + c <= a)
 			continue;
 
-		// zákon kosínov
+		// Angle at vertex v using the law of cosines.
 		double denom = 2.0 * b * c;
 		if (!isValidNumber(denom) || fabs(denom) < 1e-20)
 			continue;
 
-		double num = (b * b + c * c - a * a);
+		double num = b * b + c * c - a * a;
 		if (!isValidNumber(num))
 			continue;
 
@@ -944,14 +958,12 @@ double Plugin::ComputeVertexMetric(int metricID, CMeshO::VertexPointer v, CMeshO
 
 		angles.push_back(angle);
 
-		// dĺžky hrán použiteľné pre ratio
-		double l1 = CalculateDistance(pv, p1);
-		double l2 = CalculateDistance(pv, p2);
+		// Store adjacent edge lengths for the edge length ratio.
+		if (isValidNumber(b) && b > 0.0)
+			edgeLengths.push_back(b);
 
-		if (isValidNumber(l1) && l1 > 0.0)
-			edgeLengths.push_back(l1);
-		if (isValidNumber(l2) && l2 > 0.0)
-			edgeLengths.push_back(l2);
+		if (isValidNumber(c) && c > 0.0)
+			edgeLengths.push_back(c);
 	}
 
 	double result = 0.0;
@@ -979,42 +991,64 @@ double Plugin::ComputeVertexMetric(int metricID, CMeshO::VertexPointer v, CMeshO
 		if (!edgeLengths.empty()) {
 			double maxL = *std::max_element(edgeLengths.begin(), edgeLengths.end());
 			double minL = *std::min_element(edgeLengths.begin(), edgeLengths.end());
+
 			if (isValidNumber(maxL) && isValidNumber(minL) && minL > 0.0)
 				result = maxL / minL;
 		}
 		break;
 
-	//case 5: { // Valence (počet susedných facov)
-	//	int count = (int) faces.size();
-	//	result    = log1p((double) count);
-	//	if (!isValidNumber(result))
-	//		result = 0.0;
-	//	break;
-	//}
-	case 5: { // Valence (počet susedných facov)
-		int count = (int) faces.size();
-		result    = (double) count;
+	case 5: // Valence
+		result = static_cast<double>(adjacentVertices.size());
 		break;
-	}
 
-	case 6: { // AngleDeviation360
+	case 6: // AngleDeviation360
 		if (!angles.empty()) {
 			double sum = std::accumulate(angles.begin(), angles.end(), 0.0);
 			if (isValidNumber(sum))
 				result = fabs(sum - 360.0);
 		}
 		break;
-	}
-	case 7: { // MeanCurvature
-		//result = ComputeMeanCurvature(v, mesh);
+
+	case 7: // MeanCurvature
 		result = v->Q();
-		//result = 0.0;
-		break; 
+		break;
+
+	case 8: { // NormalDeviation
+		const vcg::Point3f& nv   = v->N();
+		float               nLen = nv.Norm();
+		if (!isValidNumber(nLen) || nLen < 1e-10f)
+			break;
+
+		double sumAngles = 0.0;
+		int    count     = 0;
+
+		for (CMeshO::VertexPointer vj : adjacentVertices) {
+			if (!vj || vj->IsD())
+				continue;
+
+			const vcg::Point3f& nj    = vj->N();
+			float               njLen = nj.Norm();
+			if (!isValidNumber(njLen) || njLen < 1e-10f)
+				continue;
+
+			float dotVal = (nv * nj) / (nLen * njLen);
+			dotVal       = std::max(-1.0f, std::min(1.0f, dotVal));
+
+			double angle = acos((double) dotVal) * 180.0 / M_PI;
+			if (isValidNumber(angle)) {
+				sumAngles += angle;
+				count++;
+			}
+		}
+
+		if (count > 0)
+			result = sumAngles / count;
+		break;
 	}
 
-	default: result = 0.0;
-	}
 
+	default: result = 0.0; break;
+	}
 
 	if (!isValidNumber(result))
 		result = 0.0;
@@ -1045,7 +1079,7 @@ double Plugin::ComputeMeanCurvature(CMeshO::VertexPointer v, CMeshO& mesh)
 	if (!isValidPoint(v->P()))
 		return 0.0;
 
-	// musí existovať adjacency: v -> incident faces
+	// there must be adjacency: v -> incident faces
 	auto it = m_vertFaceAdj.find(v);
 	if (it == m_vertFaceAdj.end() || it->second.empty())
 		return 0.0;	
@@ -1080,7 +1114,7 @@ double Plugin::ComputeMeanCurvature(CMeshO::VertexPointer v, CMeshO& mesh)
 			continue;
 		}
 
-		// nájdi index v tejto face
+		// find index in this face
 		int idx = -1;
 		for (int i = 0; i < 3; ++i)
 			if (fv[i] == v) {
@@ -1215,7 +1249,7 @@ QualityMap Plugin::ComputeNeighborhoodScore(CMeshO& mesh, const QualityMap& base
 		visited.insert(v0);
 		q.push({v0, 0});
 
-		// zahrň aj seba
+		// include yourself
 		double sum = it0->second;
 		int    cnt = 1;
 
@@ -1286,7 +1320,7 @@ QualityMap Plugin::ApplyNeighborhoodPostprocessing(
 		}
 		else { // NEIGH_IMPROVE_ONLY
 			if (useOptimalityBased) {
-				// lepšie = bližšie k 0.5
+				// better = closer to 0.5
 				double distBase    = std::fabs(baseVal - 0.5);
 				double distBlended = std::fabs(blended - 0.5);
 
@@ -1296,7 +1330,7 @@ QualityMap Plugin::ApplyNeighborhoodPostprocessing(
 					out[v] = baseVal;
 			}
 			else {
-				// pre range-based
+				// for range-based
 				if (higherIsBetter)
 					out[v] = std::max(baseVal, blended);
 				else
@@ -1412,6 +1446,14 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 		}
 		else {
 			resetCurvatureData();
+		}
+
+
+
+		const bool needNormals = (metricA == 8 || metricB == 8);
+		if (needNormals) {
+			m->updateDataMask(MeshModel::MM_VERTNORMAL);
+			tri::UpdateNormal<CMeshO>::PerVertexNormalized(mesh);
 		}
 
 
@@ -1543,7 +1585,8 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 					return -std::log1p(-raw);
 			}
 
-			if (metricID == 4 /*EdgeLengthRatio*/ || metricID == 5 /*valencia*/ || metricID == 6 /*AngleDeviation360*/)
+			if (metricID == 4 /*EdgeLengthRatio*/ || metricID == 5 /*Valence*/
+				|| metricID == 6 /*AngleDeviation360*/ || metricID == 8 /*NormalDeviation*/)
 				return std::log1p(std::max(0.0, raw));
 
 			return raw;
@@ -1843,7 +1886,7 @@ std::map<std::string, QVariant> Plugin::applyFilter(
 			QualityMap neighScore = ComputeNeighborhoodScore(mesh, scoreMap, adj, radius);
 
 			higherIsBetter = true;
-			if (metricA == 6 /*AngleDeviation360*/ || metricB == 6 /*AngleDeviation360*/)
+			if (metricA == 6 /*AngleDeviation360*/ || metricB == 6 || metricA == 8 || metricB == 8 /*NormalDeviation*/)
 				higherIsBetter = false;
 
 			QualityMap finalScore = ApplyNeighborhoodPostprocessing(
